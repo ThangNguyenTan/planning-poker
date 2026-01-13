@@ -141,8 +141,8 @@ io.on("connection", (socket) => {
 });
 
 // Handle any requests that don't match the ones above
-// Using named parameter for Express v5 wildcard compatibility
-app.get("/:path*", (req, res) => {
+// Using regex for Express v5 wildcard compatibility
+app.get(/^(?!\/socket\.io).*$/, (req, res) => {
   res.sendFile(path.join(__dirname, "../dist/index.html"));
 });
 

@@ -133,13 +133,6 @@ const App = () => {
       })
       .on("broadcast", { event: "reset" }, () => {
         setIsRevealed(false);
-        // Optimistically clear all votes locally to avoid delay
-        setParticipants((prev) => prev.map((p) => ({ ...p, vote: undefined })));
-        channel.track({
-          id: user.id,
-          name: user.name,
-          vote: undefined,
-        });
       })
       .subscribe(async (status) => {
         if (status === "SUBSCRIBED") {
@@ -185,19 +178,11 @@ const App = () => {
   const handleReset = useCallback(async () => {
     if (!channelRef.current || !user) return;
     setIsRevealed(false);
-    // Optimistically clear all votes locally to avoid delay
-    setParticipants((prev) => prev.map((p) => ({ ...p, vote: undefined })));
 
     channelRef.current.send({
       type: "broadcast",
       event: "reset",
       payload: {},
-    });
-    // Reset own vote in presence
-    channelRef.current.track({
-      id: user.id,
-      name: user.name,
-      vote: undefined,
     });
     // Persist to DB
     await supabase
@@ -310,7 +295,7 @@ const App = () => {
               onClick={handleReset}
               style={{ backgroundColor: "var(--danger)" }}
             >
-              Reset Session
+              Hide Votes
             </button>
           )}
         </div>

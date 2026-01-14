@@ -1,10 +1,11 @@
 import { useState, useCallback, useMemo, useEffect, useRef } from "react";
-import { io, Socket } from "socket.io-client";
 import { Card } from "./components/Card";
 import { Stats } from "./components/Stats";
 import { JoinForm } from "./components/JoinForm";
 import type { VoteValue, Participant } from "./types";
 import { calculateStats } from "./utils/stats";
+import { supabase } from "./lib/supabase";
+import { RealtimeChannel } from "@supabase/supabase-js";
 
 const FIBONACCI_SEQUENCE: VoteValue[] = [
   0,
@@ -22,14 +23,25 @@ const FIBONACCI_SEQUENCE: VoteValue[] = [
   "☕",
 ];
 
-const SOCKET_URL =
-  window.location.hostname === "localhost"
-    ? "http://localhost:3001"
-    : window.location.origin;
-
 const App = () => {
-  const [user, setUser] = useState<Participant | null>(null);
-  const [roomId, setRoomId] = useState<string>("");
+  const [user, setUser] = useState<Participant | null>(() => {
+    const savedName = localStorage.getItem("poker_user_name");
+    const params = new URLSearchParams(window.location.search);
+    const roomFromUrl = params.get("room");
+    if (savedName && roomFromUrl) {
+      return {
+        id: Math.random().toString(36).substring(2, 9),
+        name: savedName,
+      };
+    }
+    return null;
+  });
+
+  const [roomId, setRoomId] = useState<string>(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get("room") || "";
+  });
+
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [isRevealed, setIsRevealed] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -37,112 +49,158 @@ const App = () => {
     return (localStorage.getItem("theme") as "light" | "dark") || "light";
   });
 
-  const socketRef = useRef<Socket | null>(null);
+  const channelRef = useRef<RealtimeChannel | null>(null);
 
-  const handleJoin = useCallback((name: string, rId?: string) => {
+  // Helper to generate XXX-XXX-XXX format
+  const generateRoomId = () => {
+    const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+    const segment = () =>
+      Array.from(
+        { length: 3 },
+        () => chars[Math.floor(Math.random() * chars.length)]
+      ).join("");
+    return `${segment()}-${segment()}-${segment()}`;
+  };
+
+  const handleJoin = useCallback(async (name: string, rId?: string) => {
     setError(null);
-    if (rId) {
-      // Join existing
-      socketRef.current?.emit("join", { name, roomId: rId });
-      // We don't set user yet, wait for init/success
+
+    let targetRoomId = rId;
+
+    if (!targetRoomId) {
+      // Create new room
+      targetRoomId = generateRoomId();
+      // Optional: Persist to Supabase DB if table exists
+      await supabase
+        .from("rooms")
+        .insert([{ id: targetRoomId, is_revealed: false }])
+        .select();
     } else {
-      // Create new
-      socketRef.current?.emit("create_room", { name });
+      // Check if room exists
+      const { data, error: fetchError } = await supabase
+        .from("rooms")
+        .select("id, is_revealed")
+        .eq("id", targetRoomId)
+        .single();
+
+      if (fetchError || !data) {
+        setError(
+          "Room does not exist. Please check the ID or create a new room."
+        );
+        return;
+      }
+      setIsRevealed(data.is_revealed);
     }
-    // Store name for auto-reconnect
+
+    setRoomId(targetRoomId);
+    const newUser = { id: Math.random().toString(36).substring(2, 9), name };
+    setUser(newUser);
     localStorage.setItem("poker_user_name", name);
+
+    // Update URL
+    const url = new URL(window.location.href);
+    url.searchParams.set("room", targetRoomId);
+    window.history.pushState({}, "", url);
   }, []);
 
-  // Initialize Socket.io connection
+  // Initialize Supabase Realtime
   useEffect(() => {
-    const socket = io(SOCKET_URL);
-    socketRef.current = socket;
+    if (!user || !roomId) return;
 
-    socket.on("init", ({ participants, isRevealed }) => {
-      setParticipants(participants);
-      setIsRevealed(isRevealed);
+    const channel = supabase.channel(`room:${roomId}`, {
+      config: {
+        presence: {
+          key: user.id,
+        },
+      },
     });
 
-    socket.on("room_created", ({ roomId: newRoomId }) => {
-      setRoomId(newRoomId);
-      const savedName = localStorage.getItem("poker_user_name") || "User";
-      setUser({ id: socket.id || "", name: savedName });
+    channelRef.current = channel;
 
-      // Update URL
-      const url = new URL(window.location.href);
-      url.searchParams.set("room", newRoomId);
-      window.history.pushState({}, "", url);
-    });
-
-    socket.on("participants_update", (updatedParticipants: Participant[]) => {
-      setParticipants(updatedParticipants);
-      // If we were joining an existing room, we now know we're in
-      const savedName = localStorage.getItem("poker_user_name");
-      if (savedName && !user) {
-        setUser({ id: socket.id || "", name: savedName });
-        const params = new URLSearchParams(window.location.search);
-        setRoomId(params.get("room") || "");
-      }
-    });
-
-    socket.on("reveal_update", (revealed: boolean) => {
-      setIsRevealed(revealed);
-    });
-
-    socket.on("error_message", (msg: string) => {
-      setError(msg);
-      setUser(null);
-    });
-
-    // Check for saved user and room in URL/localStorage for auto-reconnect
-    const savedName = localStorage.getItem("poker_user_name");
-    const params = new URLSearchParams(window.location.search);
-    const roomFromUrl = params.get("room");
-
-    if (savedName && roomFromUrl) {
-      handleJoin(savedName, roomFromUrl);
-    }
+    channel
+      .on("presence", { event: "sync" }, () => {
+        const state = channel.presenceState();
+        const users = Object.values(state).flat() as unknown as Participant[];
+        setParticipants(
+          users.map((u) => ({ id: u.id, name: u.name, vote: u.vote }))
+        );
+      })
+      .on("broadcast", { event: "vote" }, () => {
+        // We rely on presence for the "source of truth" of votes
+      })
+      .on("broadcast", { event: "reveal" }, () => {
+        setIsRevealed(true);
+      })
+      .on("broadcast", { event: "reset" }, () => {
+        setIsRevealed(false);
+      })
+      .subscribe(async (status) => {
+        if (status === "SUBSCRIBED") {
+          await channel.track({
+            id: user.id,
+            name: user.name,
+            vote: undefined,
+          });
+        }
+      });
 
     return () => {
-      socket.disconnect();
+      channel.unsubscribe();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [handleJoin]);
+  }, [user, roomId]);
 
-  // Sync user ID when socket connects
-  useEffect(() => {
-    if (socketRef.current && user && !user.id) {
-      const updateId = () => {
-        setUser((prev) =>
-          prev ? { ...prev, id: socketRef.current?.id || "" } : null
-        );
-      };
-      socketRef.current.on("connect", updateId);
-      if (socketRef.current.connected) updateId();
-      return () => {
-        socketRef.current?.off("connect", updateId);
-      };
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user]);
+  // Handle voting via Presence update
+  const handleVote = useCallback(
+    (value: VoteValue) => {
+      if (!channelRef.current || !user) return;
+
+      channelRef.current.track({
+        id: user.id,
+        name: user.name,
+        vote: value,
+      });
+    },
+    [user]
+  );
+
+  const handleReveal = useCallback(async () => {
+    if (!channelRef.current) return;
+    setIsRevealed(true);
+    channelRef.current.send({
+      type: "broadcast",
+      event: "reveal",
+      payload: {},
+    });
+    // Persist to DB
+    await supabase.from("rooms").update({ is_revealed: true }).eq("id", roomId);
+  }, [roomId]);
+
+  const handleReset = useCallback(async () => {
+    if (!channelRef.current || !user) return;
+    setIsRevealed(false);
+    channelRef.current.send({
+      type: "broadcast",
+      event: "reset",
+      payload: {},
+    });
+    // Reset own vote in presence
+    channelRef.current.track({
+      id: user.id,
+      name: user.name,
+      vote: undefined,
+    });
+    // Persist to DB
+    await supabase
+      .from("rooms")
+      .update({ is_revealed: false })
+      .eq("id", roomId);
+  }, [user, roomId]);
 
   // Persist theme
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
     localStorage.setItem("theme", theme);
   }, [theme]);
-
-  const handleVote = useCallback((value: VoteValue) => {
-    socketRef.current?.emit("vote", value);
-  }, []);
-
-  const handleReveal = useCallback(() => {
-    socketRef.current?.emit("reveal");
-  }, []);
-
-  const handleReset = useCallback(() => {
-    socketRef.current?.emit("reset");
-  }, []);
 
   const toggleTheme = useCallback(() => {
     setTheme((prev) => (prev === "light" ? "dark" : "light"));
@@ -164,7 +222,7 @@ const App = () => {
     return <JoinForm onJoin={handleJoin} error={error} />;
   }
 
-  const myVote = participants.find((p) => p.id === socketRef.current?.id)?.vote;
+  const myVote = participants.find((p) => p.id === user.id)?.vote;
 
   return (
     <div className="container">
@@ -298,7 +356,7 @@ const App = () => {
                     textAlign: "center",
                   }}
                 >
-                  {p.name} {p.id === socketRef.current?.id ? "(You)" : ""}
+                  {p.name} {p.id === user.id ? "(You)" : ""}
                 </span>
               </div>
             ))}

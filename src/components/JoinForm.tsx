@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 
 interface JoinFormProps {
   onJoin: (name: string, roomId?: string) => void;
@@ -7,16 +7,10 @@ interface JoinFormProps {
 
 export const JoinForm = ({ onJoin, error }: JoinFormProps) => {
   const [name, setName] = useState("");
-  const [roomId, setRoomId] = useState("");
-
-  // Check for room ID in URL on mount
-  useEffect(() => {
+  const [roomId, setRoomId] = useState(() => {
     const params = new URLSearchParams(window.location.search);
-    const roomFromUrl = params.get("room");
-    if (roomFromUrl) {
-      setRoomId(roomFromUrl);
-    }
-  }, []);
+    return params.get("room") || "";
+  });
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();

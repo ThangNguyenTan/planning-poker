@@ -133,6 +133,11 @@ const App = () => {
       })
       .on("broadcast", { event: "reset" }, () => {
         setIsRevealed(false);
+        channel.track({
+          id: user.id,
+          name: user.name,
+          vote: undefined,
+        });
       })
       .subscribe(async (status) => {
         if (status === "SUBSCRIBED") {
